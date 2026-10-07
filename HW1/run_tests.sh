@@ -8,7 +8,7 @@ mkdir -p results || exit 1
 # Аргументы: название, сутки завершения, принято, не принято.
 run_test() {
     name=$1
-    ./hotel < "test_$name.txt" > "results/$name.out" 2>&1 || exit 1
+    ./hotel < "tests/test_$name.txt" > "results/$name.out" 2>&1 || exit 1
     cp hotel.log "results/$name.log" || exit 1
 
     printf 'Моделирование завершено на сутках: %s\nВсего приняли клиентов: %s.\nНе успели принять клиентов: %s.\n' \
@@ -26,14 +26,14 @@ check_events() {
             print day ": " $0
         }
     ' "results/$name.out" > "results/$name.events" || exit 1
-    diff -u "expected/$name.events" "results/$name.events" || exit 1
+    diff -u "tests/expected/$name.events" "results/$name.events" || exit 1
     printf 'OK: порядок событий %s\n' "$name"
 }
 
 # Ошибочный ввод должен завершить программу с кодом 1 и сообщением.
 run_error_test() {
     name=$1
-    if ./hotel < "test_$name.txt" > "results/$name.out" 2>&1; then
+    if ./hotel < "tests/test_$name.txt" > "results/$name.out" 2>&1; then
         printf 'ОШИБКА: %s принят как корректный ввод\n' "$name"
         exit 1
     else
