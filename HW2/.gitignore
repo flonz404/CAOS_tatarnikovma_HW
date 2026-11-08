@@ -1,0 +1,6 @@
+/hotel
+/hotel.log
+/results/
+/build/
+/cmake-build-*/
+/tests/__pycache__/
