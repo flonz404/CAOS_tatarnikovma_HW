@@ -6,8 +6,8 @@ system=$(uname -s)
 variant=${1:-all}
 
 case "$variant" in
-    named|unnamed|all) ;;
-    *) echo "Использование: sh run_tests.sh [named|unnamed|all]"; exit 1 ;;
+    named|unnamed|independent|all) ;;
+    *) echo "Использование: sh run_tests.sh [named|unnamed|independent|all]"; exit 1 ;;
 esac
 
 if [ "$variant" = unnamed ] && [ "$system" != Linux ]; then
@@ -18,7 +18,7 @@ fi
 run_variant() {
     name=$1
     source=$2
-    # В старых версиях glibc функции общей памяти находятся в librt.
+    # в старых версиях glibc функции общей памяти находятся в librt
     if [ "$system" = Linux ]; then
         "$compiler" -std=c11 -Wall -Wextra -Wpedantic -pthread "$source.c" -o "$source" -lrt || return 1
     else
@@ -27,13 +27,28 @@ run_variant() {
     python3 tests/check_tests.py "./$source" "$name"
 }
 
-if [ "$variant" != unnamed ]; then
+if [ "$variant" = named ] || [ "$variant" = all ]; then
     run_variant named hotel || exit 1
 fi
-if [ "$variant" != named ]; then
+if [ "$variant" = unnamed ] || [ "$variant" = all ]; then
     if [ "$system" = Linux ]; then
         run_variant unnamed hotel_unnamed || exit 1
     else
         echo "Вариант unnamed пропущен: для него нужен Linux."
     fi
+fi
+
+if [ "$variant" = independent ] || [ "$variant" = all ]; then
+    for role in manager administrator client; do
+        program="hotel_$role"
+        if [ "$role" = administrator ]; then
+            program=hotel_admin
+        fi
+        if [ "$system" = Linux ]; then
+            "$compiler" -std=c11 -Wall -Wextra -Wpedantic -pthread "independent/$role.c" independent/hotel.c -o "$program" -lrt || exit 1
+        else
+            "$compiler" -std=c11 -Wall -Wextra -Wpedantic -pthread "independent/$role.c" independent/hotel.c -o "$program" || exit 1
+        fi
+    done
+    python3 tests/check_independent.py . || exit 1
 fi

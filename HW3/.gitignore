@@ -1,6 +1,10 @@
 /hotel
 /hotel_unnamed
+/hotel_manager
+/hotel_admin
+/hotel_client
 /hotel.log
+/hotel_*.log
 /results/
 /build/
 /cmake-build-*/
