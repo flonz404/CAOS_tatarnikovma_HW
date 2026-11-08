@@ -31,15 +31,15 @@ enum ClientStatus {
 };
 
 struct Client {
-    int arrival_time;          // Момент прибытия клиента
-    int stay_days;             // Заказанный срок проживания
-    int check_in_time;         // Момент фактического заселения
-    int room_num;              // Индекс номера, -1 - отсутствие номера
-    enum ClientStatus state;  // Текущее состояние клиента
-    int work_pending;          // Есть ли ещё не обработанное событие
+    int arrival_time;          // время прибытия
+    int stay_days;             // срок проживания
+    int check_in_time;         // время заселения
+    int room_num;              // индекс номера, -1 если не назначен
+    enum ClientStatus state;
+    int work_pending;          // есть необработанное событие
 };
 
-// После fork обычные переменные копируются. Эти данные находятся в общей памяти.
+// данные, общие для родителя и детей
 struct SharedState {
     struct Client clients[MAX_CLIENTS];
     int rooms[MAX_ROOMS];
@@ -54,7 +54,7 @@ struct SharedState {
 };
 
 struct SharedState *hotel = NULL;
-// Указатели и PID остаются локальными. Дети наследуют открытые семафоры.
+// дети наследуют открытые семафоры
 sem_t *events[SEM_COUNT];
 pid_t owner_pid;
 pid_t children[MAX_CLIENTS + 1];
@@ -148,8 +148,7 @@ int create_semaphore(int index, unsigned int value){
     return 1;
 }
 
-// Каждый процесс закрывает свои отображение и семафоры.
-// Удаляет имена только родитель, после завершения всех детей.
+// каждый процесс закрывает ресурсы, имена удаляет только родитель
 void close_resources(void){
     for(int i = 0; i < SEM_COUNT; ++i){
         if(events[i] == NULL)
@@ -182,7 +181,7 @@ void close_resources(void){
     }
 }
 
-// Неожиданная ошибка в ребёнке будет замечена родителем через waitpid.
+// родитель узнает об ошибке ребёнка через waitpid
 void ipc_error(const char *text){
     perror(text);
     if(getpid() != owner_pid)
@@ -229,10 +228,9 @@ int wait_event(sem_t *event, int interruptible){
             if(failed || (interruptible && stop_requested))
                 return 0;
 
-            // Родитель периодически проверяет детей, чтобы не зависнуть,
-            // если участник аварийно завершился, не передав событие.
+            // проверяем детей во время ожидания, чтобы заметить сбой
 #ifdef __APPLE__
-            // В macOS нет sem_timedwait. Дети всё равно ждут через sem_wait.
+            // в macOS нет sem_timedwait
             if(sem_trywait(event) == 0)
                 return 1;
             if(errno == EAGAIN){
@@ -267,7 +265,7 @@ int wait_event(sem_t *event, int interruptible){
     }
 }
 
-// Эти функции вызываются только после захвата бинарного семафора ROOM_LOCK.
+// вызываются с захваченным ROOM_LOCK
 void wake_client(int client_index){
     if(!hotel->clients[client_index].work_pending){
         hotel->clients[client_index].work_pending = 1;
@@ -373,7 +371,7 @@ void client(int client_index){
     }
 }
 
-// Только родитель обрабатывает Ctrl+C и SIGTERM для всей модели.
+// сигналы остановки обрабатывает только родитель
 void prepare_child(const sigset_t *old_mask){
     struct sigaction action = {0};
     action.sa_handler = SIG_IGN;
@@ -396,8 +394,7 @@ void stop_children(void){
             post_event(events[i]);
         post_event(events[ROOM_LOCK]);
     }
-    // При аварии ребёнок мог оставить бинарный семафор занятым.
-    // На этом пути нельзя ждать его освобождения: останавливаем оставшихся.
+    // при сбое не ждём блокировку, которую мог удерживать ребёнок
     while(1){
         check_children();
         int remaining = 0;
@@ -481,7 +478,7 @@ int main(void)
         last_arrival += arrival_min + rand() % (arrival_max - arrival_min + 1);
         clients[i].arrival_time = last_arrival;
     }
-    // Перевод строки выводит накопленные приглашения до fork: дети их не повторят.
+    // выводим накопленный текст до fork
     printf("\n");
     if(stop_requested)
         return 128 + stop_requested;
@@ -512,7 +509,7 @@ int main(void)
         perror("sigprocmask");
         failed = 1;
     }
-    // Индекс -1 соответствует администратору, остальные индексы - клиентам.
+    // администратор получает индекс -1
     for(int i = -1; i < client_count && !failed && !stop_requested; ++i){
         pid_t pid = fork();
         if(pid == -1){
@@ -536,7 +533,7 @@ int main(void)
         failed = 1;
     }
 
-    // Родитель задаёт время, а действия участников выполняют дочерние процессы.
+    // родитель отсчитывает сутки и будит участников
     while(!failed && !stop_requested){
         if(!wait_event(events[ROOM_LOCK], 1))
             break;
@@ -573,7 +570,7 @@ int main(void)
         if(finished)
             break;
 
-        // Короткие части задержки позволяют замечать аварию ребёнка и во время паузы.
+        // делим задержку, чтобы вовремя заметить сбой ребёнка
         for(int part = 0; part < delay_seconds * 10 && !stop_requested && !failed; ++part){
             if(child_changed)
                 check_children();

@@ -15,9 +15,13 @@ import time
 
 
 binary = Path(sys.argv[1]).resolve()
+variant = sys.argv[2] if len(sys.argv) > 2 else "named"
+assert variant in ("named", "unnamed"), "вариант должен быть named или unnamed"
 tests = Path(__file__).resolve().parent
-results = Path.cwd() / "results"
-results.mkdir(exist_ok=True)
+source = tests.parent / ("hotel.c" if variant == "named" else "hotel_unnamed.c")
+memory_prefix = "hotel3" if variant == "named" else "hotel3u"
+results = Path.cwd() / "results" / variant
+results.mkdir(parents=True, exist_ok=True)
 passed = 0
 
 libc = ctypes.CDLL(None, use_errno=True)
@@ -31,7 +35,7 @@ libc.sem_close.restype = ctypes.c_int
 
 def check_cleanup(pid):
     # Ничего не создаём: открытие без O_CREAT должно вернуть ENOENT.
-    name = f"/hotel3_{pid}_memory".encode()
+    name = f"/{memory_prefix}_{pid}_memory".encode()
     fd = libc.shm_open(name, os.O_RDWR, 0)
     error = ctypes.get_errno()
     if fd >= 0:
@@ -352,19 +356,33 @@ def check_failures():
         build = Path(temporary)
         compiler = os.environ.get("CC", "gcc")
         options = ["-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-pthread"]
-        subprocess.run([compiler, *options, "-Dfork=test_fork", "-Dsem_open=test_sem_open",
+        semaphore_call = "sem_open" if variant == "named" else "sem_init"
+        overrides = [f"-D{semaphore_call}=test_{semaphore_call}"]
+        if variant == "unnamed":
+            overrides += ["-Dsem_destroy=test_sem_destroy", "-Dmunmap=test_munmap"]
+        subprocess.run([compiler, *options, "-Dfork=test_fork", *overrides,
                         "-Dftruncate=test_ftruncate", "-Dmmap=test_mmap", "-c",
-                        str(tests.parent / "hotel.c"), "-o", str(build / "hotel.o")], check=True)
+                        str(source), "-o", str(build / "hotel.o")], check=True)
         libraries = ["-lrt"] if sys.platform.startswith("linux") else []
         faulty = build / "hotel_failures"
         subprocess.run([compiler, *options, str(build / "hotel.o"), str(tests / "failures.c"),
                         "-o", str(faulty), *libraries], check=True)
-        for failure in ("fork", "sem_open", "ftruncate", "mmap"):
+        if variant == "unnamed":
+            directory = results / "unnamed_lifecycle"
+            directory.mkdir(exist_ok=True)
+            code, output = execute(directory, data, executable=faulty,
+                                   env=dict(os.environ, HOTEL_TEST_FAILURE=""))
+            assert code == 0, output
+            check_events(output, list(map(int, data.split())), (directory / "hotel.log").read_text())
+            passed += 1
+            print("OK: unnamed_lifecycle", flush=True)
+        for failure in ("fork", semaphore_call, "ftruncate", "mmap"):
             directory = results / f"failed_{failure}"
             directory.mkdir(exist_ok=True)
             env = dict(os.environ, HOTEL_TEST_FAILURE=failure)
             code, output = execute(directory, data, executable=faulty, env=env)
             assert code == 1 and failure in output, output
+            assert "Ошибка проверки семафоров" not in output, output
             passed += 1
             print(f"OK: failed_{failure}", flush=True)
 
@@ -397,4 +415,4 @@ check_input_signal()
 check_parallel()
 check_failed_child()
 check_failures()
-print(f"\nВсе {passed} проверок пройдены. Результаты сохранены в {results}.")
+print(f"\nВариант {variant}: все {passed} проверок пройдены. Результаты сохранены в {results}.")

@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <semaphore.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -57,3 +58,52 @@ void *test_mmap(void *address, size_t length, int protection, int flags, int fd,
     }
     return mmap(address, length, protection, flags, fd, offset);
 }
+
+#ifdef __linux__
+// Сохраняем адреса, чтобы проверить порядок освобождения неименованных семафоров.
+static sem_t *initialized[103];
+static int initialized_count = 0;
+static pid_t semaphore_owner;
+
+int test_sem_init(sem_t *event, int pshared, unsigned int value){
+    static int calls = 0;
+    if(++calls == 3 && selected("sem_init")){
+        errno = ENOSPC;
+        return -1;
+    }
+    if(pshared != 1 || initialized_count == 103){
+        fprintf(stderr, "Ошибка проверки семафоров: неверная инициализация.\n");
+        errno = EINVAL;
+        return -1;
+    }
+    int result = sem_init(event, pshared, value);
+    if(result == 0){
+        semaphore_owner = getpid();
+        initialized[initialized_count++] = event;
+    }
+    return result;
+}
+
+int test_sem_destroy(sem_t *event){
+    for(int i = 0; i < initialized_count && getpid() == semaphore_owner; ++i){
+        if(initialized[i] == event){
+            int result = sem_destroy(event);
+            if(result == 0)
+                initialized[i] = initialized[--initialized_count];
+            return result;
+        }
+    }
+    fprintf(stderr, "Ошибка проверки семафоров: уничтожение чужого или не созданного семафора.\n");
+    errno = EINVAL;
+    return -1;
+}
+
+int test_munmap(void *address, size_t length){
+    if(getpid() == semaphore_owner && initialized_count != 0){
+        fprintf(stderr, "Ошибка проверки семафоров: память освобождается до sem_destroy.\n");
+        errno = EBUSY;
+        return -1;
+    }
+    return munmap(address, length);
+}
+#endif
