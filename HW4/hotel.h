@@ -38,7 +38,11 @@ enum MessageType {
     DEPARTED,
     REJECTED,
     STOP,
-    ERROR_MESSAGE
+    ERROR_MESSAGE,
+    WATCH,
+    WATCH_READY,
+    RECEPTION_CLOSED,
+    FINISHED
 };
 
 struct Message {
@@ -53,6 +57,7 @@ int read_int(const char *text, int min, int max, int *value);
 double current_seconds(void);
 int make_address(const char *ip, const char *port, struct sockaddr_in *address);
 int prepare_socket(int fd);
+int connect_server(struct sockaddr_in *address);
 void encode_message(unsigned char data[MESSAGE_SIZE], struct Message message);
 struct Message decode_message(const unsigned char data[MESSAGE_SIZE]);
 int wait_socket(int fd, short events, double deadline);

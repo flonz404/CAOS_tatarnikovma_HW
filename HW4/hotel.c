@@ -155,3 +155,37 @@ int receive_message(int fd, struct Message *message){
     *message = decode_message(data);
     return 1;
 }
+
+int connect_server(struct sockaddr_in *address){
+    if(address->sin_addr.s_addr == htonl(INADDR_ANY)){
+        fprintf(stderr, "Укажите адрес компьютера с сервером, а не 0.0.0.0.\n");
+        return -1;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(fd == -1){
+        perror("socket");
+        return -1;
+    }
+    if(!prepare_socket(fd)){
+        close(fd);
+        return -1;
+    }
+    if(connect(fd, (struct sockaddr *)address, sizeof(*address)) == -1){
+        if(errno != EINPROGRESS || !wait_socket(fd, POLLOUT, current_seconds() + NETWORK_TIMEOUT)){
+            if(!stop_requested)
+                perror("Подключение к серверу");
+            close(fd);
+            return -1;
+        }
+        int error = 0;
+        socklen_t size = sizeof(error);
+        if(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == -1 || error != 0){
+            if(error != 0)
+                errno = error;
+            perror("Подключение к серверу");
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}

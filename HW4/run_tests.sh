@@ -2,6 +2,7 @@
 
 cd "$(dirname "$0")" || exit 1
 compiler=${CC:-gcc}
-"$compiler" -std=c11 -Wall -Wextra -Wpedantic server.c hotel.c -o hotel_server || exit 1
-"$compiler" -std=c11 -Wall -Wextra -Wpedantic client.c hotel.c -o hotel_client || exit 1
+for role in server client observer; do
+    "$compiler" -std=c11 -Wall -Wextra -Wpedantic "$role.c" hotel.c -o "hotel_$role" || exit 1
+done
 python3 tests/check_tests.py .

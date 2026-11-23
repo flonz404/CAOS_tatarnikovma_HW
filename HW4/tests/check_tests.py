@@ -86,6 +86,12 @@ class Session:
         self.clients[name] = process
         return process
 
+    def add_observer(self):
+        process = self.spawn("observer", "hotel_observer", ["127.0.0.1", self.port])
+        until(lambda: "Наблюдатель подключён." in self.output("observer") or process.poll() is not None)
+        assert process.poll() is None, self.output("observer")
+        return process
+
     def connect(self):
         connection = socket.create_connection(("127.0.0.1", self.port), timeout=15)
         connection.settimeout(15)
@@ -195,19 +201,24 @@ def run_case(name, function):
     print(f"OK {name}", flush=True)
 
 
-def data_case(path):
+def data_case(path, watch=False):
     data = list(map(int, path.read_text().split()))
-    with Session(path.stem, data) as session:
+    with Session(("observer_" if watch else "") + path.stem, data) as session:
         if "invalid" in path.stem:
             session.wait()
             assert session.server.returncode == 1
             assert "Сервер готов:" not in session.output("server")
             return
         session.ready()
+        if watch:
+            session.add_observer()
         for number in range(1, data[1] + 1):
             session.add_client(number)
         session.wait(timeout=120)
-        return check_model(session)
+        result = check_model(session)
+        if watch:
+            check_observer(session, result)
+        return result
 
 
 def normal_case(name, data, bind="127.0.0.1"):
@@ -249,10 +260,12 @@ def extra_connections():
         return check_model(session)
 
 
-def interrupted(target, sig):
-    name = f"{target}_{sig.name}"
+def interrupted(target, sig, watch=False):
+    name = ("observer_" if watch else "") + f"{target}_{sig.name}"
     with Session(name, [1, 3, 0, 0, 1, 1, 100, 100, 100]) as session:
         session.ready()
+        if watch:
+            session.add_observer()
         for number in range(1, 4):
             session.add_client(number)
         until(lambda: "назначил" in session.output("server"))
@@ -263,6 +276,10 @@ def interrupted(target, sig):
         for other in session.processes:
             if other is not process:
                 assert other.returncode == 1
+        if watch:
+            text = session.output("observer")
+            assert "завершено" not in text
+            assert "остановлено" in text or "связь с сервером потеряна" in text
 
 
 def fragmented_client():
@@ -381,6 +398,126 @@ def invalid_arguments():
             output.write(f"{role} {arguments}\n{result.stdout}\n")
 
 
+def check_observer(session, result):
+    text = session.output("observer")
+    assert all(process.returncode == 0 for process in session.processes), text
+    assert f"Номеров: {session.data[0]}. Клиентов: {session.data[1]}." in text
+    assert list(map(int, re.findall(r"^Сутки (\d+)$", text, re.M))) == list(range(result["day"] + 1))
+    assert sorted(map(int, re.findall(r"Подключился клиент (\d+)\.", text))) == list(range(1, session.data[1] + 1))
+    expected, observed, progress, checked = [], [], [], []
+    patterns = [
+        (r"получен запрос клиента (\d+) на (\d+) суток\.", r"Клиент (\d+) прибыл и запрашивает номер на (\d+) суток\.", "request"),
+        (r"клиент (\d+) поставлен в очередь\.", r"Клиент (\d+) поставлен в очередь, место при постановке: \d+\.", "queue"),
+        (r"администратор назначил клиенту (\d+) номер (\d+) на (\d+) суток\.", r"Администратор назначил клиенту (\d+) номер (\d+) на (\d+) суток\.", "room"),
+        (r"получен выезд клиента (\d+), номер (\d+) освобождён\.", r"Клиент (\d+) выехал, номер (\d+) освобождён\.", "checkout"),
+        (r"клиент (\d+) не принят, приём закрыт\.", r"Клиент (\d+) не принят: прибытие на сутках \d+, приём закрыт\.", "rejected"),
+        (r"приём закрыт, очередь продолжает обслуживаться\.", r"Приём закрыт\. Очередь продолжает обслуживаться\.", "closed"),
+    ]
+    for line in session.output("server").splitlines():
+        match = re.fullmatch(r"Сутки (\d+): (.*)", line)
+        if match:
+            for source, _, kind in patterns:
+                event = re.fullmatch(source, match[2])
+                if event:
+                    expected.append((kind, int(match[1]), *map(int, event.groups())))
+    day = -1
+    for line in text.splitlines():
+        match = re.fullmatch(r"Сутки (\d+)", line)
+        if match:
+            day = int(match[1])
+        for _, pattern, kind in patterns:
+            event = re.fullmatch(pattern, line)
+            if event:
+                observed.append((kind, day, *map(int, event.groups())))
+        match = re.fullmatch(r"Клиент (\d+) завершил (\d+) суток проживания из (\d+)\.", line)
+        if match:
+            progress.append((day, *map(int, match.groups())))
+        match = re.fullmatch(r"Клиент (\d+) заселился в номер (\d+)\.", line)
+        if match:
+            checked.append((day, *map(int, match.groups())))
+    assert observed == expected, "наблюдатель потерял, переставил или повторил событие"
+    expected_progress, expected_checked = [], []
+    for number in range(1, session.data[1] + 1):
+        client = session.output(f"client_{number}")
+        expected_progress.extend(tuple(map(int, item)) for item in re.findall(
+            r"Сутки (\d+): клиент (\d+) завершил (\d+) суток проживания из (\d+)\.", client))
+        expected_checked.extend(tuple(map(int, item)) for item in re.findall(
+            r"Сутки (\d+): клиент (\d+) получил назначение и заселился в номер (\d+)", client))
+    assert sorted(progress) == sorted(expected_progress), "неполная информация о проживании"
+    assert sorted(checked) == sorted(expected_checked), "нет подтверждения заселения"
+    assert f"Моделирование завершено на сутках: {result['day']}." in text
+    assert f"Завершили проживание: {result['accepted']}. Не приняты: {result['rejected']}." in text
+
+
+def observer_rejections():
+    with Session("observer_rejections", [1, 2, 0, 0, 1, 1, 1, 1]) as session:
+        session.ready()
+        session.add_client(1)
+        until(lambda: "подключён" in session.output("client_1"))
+        session.add_observer()
+        duplicate = session.spawn("duplicate", "hotel_observer", ["127.0.0.1", session.port])
+        assert duplicate.wait(timeout=10) == 1
+        session.add_client(2)
+        until(lambda: "назначил" in session.output("server"))
+        late = session.spawn("late", "hotel_observer", ["127.0.0.1", session.port])
+        assert late.wait(timeout=10) == 1
+        session.wait()
+        session.processes.remove(duplicate)
+        session.processes.remove(late)
+        check_observer(session, check_model(session))
+
+
+def observer_disconnect(sig):
+    with Session(f"observer_disconnect_{sig.name}", [1, 2, 0, 0, 1, 1, 1, 1]) as session:
+        session.ready()
+        observer = session.add_observer()
+        for number in (1, 2):
+            session.add_client(number)
+        until(lambda: "назначил" in session.output("server"))
+        observer.send_signal(sig)
+        session.wait()
+        assert observer.returncode == (-sig if sig == signal.SIGKILL else 128 + sig)
+        return check_model(session)
+
+
+def observer_startup_timeout():
+    with Session("observer_startup_timeout", [1, 1, 0, 0, 1, 0, 1], startup=1) as session:
+        session.ready()
+        session.add_observer()
+        session.wait()
+        assert all(process.returncode == 1 for process in session.processes)
+        assert "остановлено" in session.output("observer")
+
+
+def observer_invalid_message():
+    with Session("observer_invalid_message", [1, 1, 0, 0, 1, 0, 1]) as session:
+        session.ready()
+        with session.connect() as observer:
+            for byte in wire(15, 0, 0, 0):
+                observer.sendall(bytes([byte]))
+            assert receive(observer) == (16, 1, 1, 1)
+            observer.sendall(wire(1, 0, 1, 0))
+            assert receive(observer)[0] == 14
+        session.add_client(1)
+        session.wait()
+        return check_model(session)
+
+
+def observer_slow():
+    with Session("observer_slow", [10, 10, 0, 0, 1, 0] + [1000] * 10) as session:
+        session.ready()
+        with socket.socket() as observer:
+            observer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512)
+            observer.settimeout(10)
+            observer.connect(("127.0.0.1", session.port))
+            observer.sendall(wire(15, 0, 0, 0))
+            assert receive(observer)[0] == 16
+            for number in range(1, 11):
+                session.add_client(number)
+            session.wait(timeout=60)
+        return check_model(session)
+
+
 for path in sorted((ROOT / "tests").glob("test_*.txt")):
     run_case(path.stem, lambda path=path: data_case(path))
 for name, text in [("invalid_token", "abc\n"), ("empty_input", ""),
@@ -407,5 +544,16 @@ run_case("invalid_arguments", invalid_arguments)
 for target in ["server", "client"]:
     for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]:
         run_case(f"{target}_{sig.name}", lambda target=target, sig=sig: interrupted(target, sig))
+for path in sorted((ROOT / "tests").glob("test_*.txt")):
+    if "invalid" not in path.stem:
+        run_case("observer_" + path.stem, lambda path=path: data_case(path, watch=True))
+run_case("observer_rejections", observer_rejections)
+run_case("observer_startup_timeout", observer_startup_timeout)
+run_case("observer_invalid_message", observer_invalid_message)
+run_case("observer_slow", observer_slow)
+for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]:
+    run_case(f"observer_disconnect_{sig.name}", lambda sig=sig: observer_disconnect(sig))
+for target, sig in [("server", signal.SIGINT), ("server", signal.SIGKILL), ("client", signal.SIGTERM)]:
+    run_case(f"observer_{target}_{sig.name}", lambda target=target, sig=sig: interrupted(target, sig, watch=True))
 (RESULTS / "summary.json").write_text(json.dumps(passed, ensure_ascii=False, indent=2) + "\n")
 print(f"Пройдено тестов: {len(passed)}.")

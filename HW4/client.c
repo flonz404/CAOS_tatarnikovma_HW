@@ -2,36 +2,6 @@
 
 enum ClientStatus { NOT_ARRIVED, REQUEST_SENT, WAITING, LIVING, LEAVING };
 
-int connect_server(struct sockaddr_in *address){
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(fd == -1){
-        perror("socket");
-        return -1;
-    }
-    if(!prepare_socket(fd)){
-        close(fd);
-        return -1;
-    }
-    if(connect(fd, (struct sockaddr *)address, sizeof(*address)) == -1){
-        if(errno != EINPROGRESS || !wait_socket(fd, POLLOUT, current_seconds() + NETWORK_TIMEOUT)){
-            if(!stop_requested)
-                perror("Подключение к серверу");
-            close(fd);
-            return -1;
-        }
-        int error = 0;
-        socklen_t size = sizeof(error);
-        if(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == -1 || error != 0){
-            if(error != 0)
-                errno = error;
-            perror("Подключение к серверу");
-            close(fd);
-            return -1;
-        }
-    }
-    return fd;
-}
-
 int client(int fd, int number){
     if(!send_message(fd, (struct Message){HELLO, 0, (uint32_t)number, 0}))
         return 0;
@@ -126,10 +96,6 @@ int main(int argc, char *argv[]){
     if(!prepare_program() || !make_address(argv[1], argv[2], &address) ||
        !parse_int(argv[3], 1, MAX_CLIENTS, &number))
         return 1;
-    if(address.sin_addr.s_addr == htonl(INADDR_ANY)){
-        fprintf(stderr, "Укажите адрес компьютера с сервером, а не 0.0.0.0.\n");
-        return 1;
-    }
     int fd = connect_server(&address);
     if(fd == -1)
         return stop_requested ? 128 + stop_requested : 1;

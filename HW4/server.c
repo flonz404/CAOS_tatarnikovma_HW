@@ -1,7 +1,7 @@
 #include "hotel.h"
 
 #define MAX_CONNECTIONS (MAX_CLIENTS + 8)
-#define OUTPUT_SIZE (MESSAGE_SIZE * 8)
+#define OUTPUT_SIZE (MESSAGE_SIZE * (MAX_CLIENTS * 8 + 8))
 
 enum ClientStatus { NOT_ARRIVED, WAITING, ASSIGNED, LIVING, LEFT, NOT_ACCEPTED };
 
@@ -26,17 +26,20 @@ int rooms[MAX_ROOMS], queue[MAX_CLIENTS];
 int room_count, client_count, reception_end, delay_seconds;
 int head = 0, tail = 0, joined_count = 0, current_time = 0;
 int started = 0, failed = 0;
+int observer = -1;
 
 void close_connection(int index){
     struct Connection *connection = &connections[index];
     if(connection->fd != -1)
         close(connection->fd);
     connection->fd = -1;
+    if(index == observer)
+        observer = -1;
 }
 
 void connection_lost(int index){
     int guest = connections[index].client_index;
-    if(guest != -1 && clients[guest].state != LEFT && clients[guest].state != NOT_ACCEPTED){
+    if(guest >= 0 && clients[guest].state != LEFT && clients[guest].state != NOT_ACCEPTED){
         fprintf(stderr, "Ошибка: потеряна связь с клиентом %d. Моделирование остановлено.\n", guest + 1);
         failed = 1;
     }
@@ -47,7 +50,17 @@ void queue_message(int index, int type, int day, int value, int extra){
     struct Connection *connection = &connections[index];
     if(connection->fd == -1)
         return;
+    if(connection->output_size + MESSAGE_SIZE > OUTPUT_SIZE && connection->sent > 0){
+        connection->output_size -= connection->sent;
+        memmove(connection->output, connection->output + connection->sent, connection->output_size);
+        connection->sent = 0;
+    }
     if(connection->output_size + MESSAGE_SIZE > OUTPUT_SIZE){
+        if(index == observer){
+            fprintf(stderr, "Наблюдатель отключён: не успевает получать события.\n");
+            close_connection(index);
+            return;
+        }
         fprintf(stderr, "Ошибка: переполнен буфер отправки.\n");
         failed = 1;
         return;
@@ -55,6 +68,11 @@ void queue_message(int index, int type, int day, int value, int extra){
     struct Message message = {(uint32_t)type, (uint32_t)day, (uint32_t)value, (uint32_t)extra};
     encode_message(connection->output + connection->output_size, message);
     connection->output_size += MESSAGE_SIZE;
+}
+
+void observe(int type, int value, int extra){
+    if(observer != -1)
+        queue_message(observer, type, current_time, value, extra);
 }
 
 int find_free_room(int rooms[], int room_count){
@@ -75,6 +93,7 @@ void check_in(int client_index, int room_index){
     printf("Сутки %d: администратор назначил клиенту %d номер %d на %d суток.\n",
            current_time, client_index + 1, room_index + 1, guest->stay_days);
     queue_message(guest->connection, ROOM, current_time, room_index + 1, guest->stay_days);
+    observe(ROOM, client_index + 1, room_index + 1);
 }
 
 void settle_queue(void){
@@ -87,7 +106,7 @@ void settle_queue(void){
 }
 
 void protocol_error(int index){
-    if(connections[index].client_index != -1){
+    if(connections[index].client_index >= 0){
         fprintf(stderr, "Ошибка: неверное сообщение от клиента %d.\n", connections[index].client_index + 1);
         failed = 1;
     }
@@ -99,7 +118,27 @@ void protocol_error(int index){
 
 void handle_message(int index, struct Message message){
     struct Connection *connection = &connections[index];
+    if(index == observer){
+        protocol_error(index);
+        return;
+    }
     if(connection->client_index == -1){
+        if(message.type == WATCH && message.day == 0 && message.value == 0 && message.extra == 0){
+            if(started || observer != -1){
+                queue_message(index, ERROR_MESSAGE, current_time, 3, 0);
+                connection->closing = 1;
+                return;
+            }
+            observer = index;
+            connection->client_index = -2;
+            queue_message(index, WATCH_READY, reception_end, room_count, client_count);
+            for(int i = 0; i < client_count; ++i){
+                if(clients[i].connection != -1)
+                    observe(HELLO, i + 1, 0);
+            }
+            printf("Наблюдатель подключён.\n");
+            return;
+        }
         if(message.type != HELLO || message.day != 0 || message.extra != 0 ||
            message.value < 1 || message.value > (uint32_t)client_count){
             protocol_error(index);
@@ -116,6 +155,7 @@ void handle_message(int index, struct Message message){
         ++joined_count;
         printf("Подключился клиент %d. Подключено: %d из %d.\n", guest + 1, joined_count, client_count);
         queue_message(index, WELCOME, clients[guest].arrival_time, clients[guest].stay_days, reception_end);
+        observe(HELLO, guest + 1, 0);
         return;
     }
 
@@ -134,21 +174,25 @@ void handle_message(int index, struct Message message){
             current_time == guest->arrival_time && current_time < reception_end &&
             message.value == (uint32_t)guest->stay_days && message.extra == 0){
         printf("Сутки %d: получен запрос клиента %d на %d суток.\n", current_time, client_index + 1, guest->stay_days);
+        observe(REQUEST, client_index + 1, guest->stay_days);
         queue[tail++] = client_index;
         guest->state = WAITING;
         guest->work_pending = 0;
         printf("Сутки %d: клиент %d поставлен в очередь.\n", current_time, client_index + 1);
         queue_message(index, QUEUED, current_time, tail - head, 0);
+        observe(QUEUED, client_index + 1, tail - head);
     }
     else if(message.type == CHECKED_IN && guest->state == ASSIGNED &&
             message.value == (uint32_t)(guest->room_num + 1) && message.extra == (uint32_t)guest->stay_days){
         guest->state = LIVING;
         guest->work_pending = 0;
+        observe(CHECKED_IN, client_index + 1, guest->room_num + 1);
     }
     else if(message.type == PROGRESS && guest->state == LIVING && guest->work_pending == 1 &&
             message.value == (uint32_t)(current_time - guest->check_in_time) &&
             message.extra == (uint32_t)guest->stay_days){
         guest->work_pending = message.value == (uint32_t)guest->stay_days ? 2 : 0;
+        observe(PROGRESS, client_index + 1, (int)message.value);
     }
     else if(message.type == CHECKOUT && guest->state == LIVING && guest->work_pending == 2 &&
             message.value == (uint32_t)(guest->room_num + 1) && message.extra == 0){
@@ -159,6 +203,7 @@ void handle_message(int index, struct Message message){
         guest->work_pending = 0;
         printf("Сутки %d: получен выезд клиента %d, номер %d освобождён.\n", current_time, client_index + 1, room + 1);
         queue_message(index, DEPARTED, current_time, room + 1, 0);
+        observe(CHECKOUT, client_index + 1, room + 1);
         connection->closing = 1;
     }
     else
@@ -263,9 +308,9 @@ void service_network(int listener, int timeout){
         accept_connections(listener);
 }
 
-int output_pending(void){
+int output_pending(int include_observer){
     for(int i = 0; i < MAX_CONNECTIONS; ++i){
-        if(connections[i].fd != -1 && connections[i].output_size != 0)
+        if((include_observer || i != observer) && connections[i].fd != -1 && connections[i].output_size != 0)
             return 1;
     }
     return 0;
@@ -288,8 +333,11 @@ int all_finished(void){
 }
 
 void start_day(void){
-    if(current_time == reception_end)
+    observe(TICK, 0, 0);
+    if(current_time == reception_end){
         printf("Сутки %d: приём закрыт, очередь продолжает обслуживаться.\n", current_time);
+        observe(RECEPTION_CLOSED, 0, 0);
+    }
     for(int i = 0; i < client_count; ++i){
         struct Client *guest = &clients[i];
         if(guest->state == NOT_ARRIVED && current_time >= reception_end){
@@ -297,6 +345,7 @@ void start_day(void){
             queue_message(guest->connection, REJECTED, current_time, guest->arrival_time, 0);
             connections[guest->connection].closing = 1;
             printf("Сутки %d: клиент %d не принят, приём закрыт.\n", current_time, i + 1);
+            observe(REJECTED, i + 1, guest->arrival_time);
         }
         else if(guest->state == NOT_ARRIVED || guest->state == LIVING || guest->state == WAITING){
             guest->work_pending = 1;
@@ -379,7 +428,7 @@ int main(int argc, char *argv[]){
         if(started){
             if(!work_pending())
                 settle_queue();
-            if(!work_pending() && !output_pending()){
+            if(!work_pending() && !output_pending(0)){
                 if(all_finished())
                     break;
                 if(!day_complete){
@@ -409,13 +458,20 @@ int main(int argc, char *argv[]){
                 connections[i].closing = 1;
             }
         }
-        double deadline = current_seconds() + 2;
-        while(output_pending() && current_seconds() < deadline)
-            service_network(-1, 50);
         printf("Моделирование остановлено на сутках: %d.\n", current_time);
     }
-    else
+    else{
         printf("Обслуживание завершено на сутках: %d.\n", current_time);
+        int completed = 0;
+        for(int i = 0; i < client_count; ++i)
+            completed += clients[i].state == LEFT;
+        observe(FINISHED, completed, client_count - completed);
+        if(observer != -1)
+            connections[observer].closing = 1;
+    }
+    double deadline = current_seconds() + 2;
+    while(output_pending(1) && current_seconds() < deadline)
+        service_network(-1, 50);
     for(int i = 0; i < MAX_CONNECTIONS; ++i)
         close_connection(i);
     return failed ? 1 : (stop_requested ? 128 + stop_requested : 0);
