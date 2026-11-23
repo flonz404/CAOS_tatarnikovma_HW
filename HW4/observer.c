@@ -8,7 +8,7 @@ int watch_hotel(int fd){
         return 0;
     if(message.type != WATCH_READY || message.value < 1 || message.value > MAX_ROOMS ||
        message.extra < 1 || message.extra > MAX_CLIENTS){
-        fprintf(stderr, "Наблюдатель не подключён. Подключите одного наблюдателя до начала моделирования.\n");
+        fprintf(stderr, "Наблюдатель не подключён. Проверьте сервер и лимит подключений.\n");
         return 0;
     }
     int client_count = (int)message.extra;
@@ -17,12 +17,55 @@ int watch_hotel(int fd){
            message.value, message.extra, message.day);
     while(!stop_requested && receive_message(fd, &message)){
         uint32_t number = message.value, value = message.extra;
-        if(message.type <= REJECTED && message.type != TICK &&
+        if(((message.type <= REJECTED && message.type != TICK) ||
+            (message.type >= CLIENT_INFO && message.type <= STAY_START)) &&
            (number < 1 || number > (uint32_t)client_count)){
             fprintf(stderr, "Ошибка: неверный номер клиента в событии.\n");
             return 0;
         }
         switch(message.type){
+            case SNAPSHOT:
+                printf("\nСостояние гостиницы на сутках %u. %s\n", message.day,
+                       number ? (value ? "Приём закрыт." : "Приём открыт.") : "Модель ожидает клиентов.");
+                break;
+            case CLIENT_INFO:
+                stays[number - 1] = value;
+                printf("Клиент %u: прибытие на сутках %u, срок проживания %u суток.\n", number, message.day, value);
+                break;
+            case CLIENT_STATE:
+                printf("Клиент %u: ", number);
+                switch(message.day){
+                    case HELLO:
+                        printf("ожидает прибытия, %s.\n", value ? "подключён" : "ещё не подключён");
+                        break;
+                    case QUEUED:
+                        printf("ожидает номер, место в очереди: %u.\n", value);
+                        break;
+                    case ROOM:
+                        printf("назначен номер %u, ожидается подтверждение заселения.\n", value);
+                        break;
+                    case CHECKED_IN:
+                        printf("проживает в номере %u.\n", value);
+                        break;
+                    case CHECKOUT:
+                        printf("завершил проживание.\n");
+                        break;
+                    case REJECTED:
+                        printf("не принят.\n");
+                        break;
+                    default:
+                        fprintf(stderr, "Ошибка: неверное состояние клиента.\n");
+                        return 0;
+                }
+                break;
+            case STAY_START:
+                printf("Клиент %u: время заселения – сутки %u.\n", number, message.day);
+                break;
+            case SNAPSHOT_END:
+                printf("\nНовые события:\n");
+                if(number)
+                    printf("Сутки %u (после подключения)\n", message.day);
+                break;
             case HELLO:
                 printf("Подключился клиент %u.\n", number);
                 break;

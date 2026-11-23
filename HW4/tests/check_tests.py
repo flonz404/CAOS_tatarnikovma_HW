@@ -54,6 +54,7 @@ class Session:
         self.processes = []
         self.files = []
         self.clients = {}
+        self.observers = {}
         text = data if isinstance(data, str) else "\n".join(map(str, data)) + "\n"
         (self.folder / "input.txt").write_text(text)
         self.server = self.spawn("server", "hotel_server", [bind, self.port, startup], text)
@@ -86,10 +87,11 @@ class Session:
         self.clients[name] = process
         return process
 
-    def add_observer(self):
-        process = self.spawn("observer", "hotel_observer", ["127.0.0.1", self.port])
-        until(lambda: "Наблюдатель подключён." in self.output("observer") or process.poll() is not None)
-        assert process.poll() is None, self.output("observer")
+    def add_observer(self, name="observer"):
+        process = self.spawn(name, "hotel_observer", ["127.0.0.1", self.port])
+        self.observers[name] = process
+        until(lambda: "Новые события:" in self.output(name) or process.poll() is not None)
+        assert "Новые события:" in self.output(name), self.output(name)
         return process
 
     def connect(self):
@@ -398,12 +400,14 @@ def invalid_arguments():
             output.write(f"{role} {arguments}\n{result.stdout}\n")
 
 
-def check_observer(session, result):
-    text = session.output("observer")
-    assert all(process.returncode == 0 for process in session.processes), text
+def check_observer(session, result, name="observer"):
+    text = session.output(name)
+    assert session.observers[name].returncode == 0, text
     assert f"Номеров: {session.data[0]}. Клиентов: {session.data[1]}." in text
     assert list(map(int, re.findall(r"^Сутки (\d+)$", text, re.M))) == list(range(result["day"] + 1))
-    assert sorted(map(int, re.findall(r"Подключился клиент (\d+)\.", text))) == list(range(1, session.data[1] + 1))
+    connected = re.findall(r"Подключился клиент (\d+)\.", text)
+    connected += re.findall(r"Клиент (\d+): ожидает прибытия, подключён\.", text)
+    assert sorted(map(int, connected)) == list(range(1, session.data[1] + 1))
     expected, observed, progress, checked = [], [], [], []
     patterns = [
         (r"получен запрос клиента (\d+) на (\d+) суток\.", r"Клиент (\d+) прибыл и запрашивает номер на (\d+) суток\.", "request"),
@@ -449,35 +453,69 @@ def check_observer(session, result):
     assert f"Завершили проживание: {result['accepted']}. Не приняты: {result['rejected']}." in text
 
 
-def observer_rejections():
-    with Session("observer_rejections", [1, 2, 0, 0, 1, 1, 1, 1]) as session:
+def read_snapshot(connection):
+    messages = [receive(connection)]
+    assert messages[0][0] == 16
+    while messages[-1][0] != 23:
+        messages.append(receive(connection))
+        assert len(messages) <= 303, "снимок не завершён"
+    assert messages[1][0] == 19
+    assert sorted(item[2] for item in messages if item[0] == 20) == list(range(1, messages[0][3] + 1))
+    assert sorted(item[2] for item in messages if item[0] == 21) == list(range(1, messages[0][3] + 1))
+    return messages
+
+
+def check_late_observer(session, name, result):
+    text = session.output(name)
+    assert session.observers[name].returncode == 0, text
+    snapshot, live = text.split("Новые события:\n", 1)
+    assert len(re.findall(r"Клиент \d+: прибытие на сутках", snapshot)) == session.data[1]
+    for number, stay in enumerate(session.data[6:], 1):
+        assert re.search(fr"Клиент {number}: прибытие на сутках \d+, срок проживания {stay} суток\.", snapshot)
+    actual = [line for line in live.splitlines() if line and "(после подключения)" not in line]
+    reference = [line for line in session.output("observer").split("Новые события:\n", 1)[1].splitlines() if line]
+    assert actual and reference[-len(actual):] == actual, "после снимка потеряны или повторены события"
+    assert f"Завершили проживание: {result['accepted']}. Не приняты: {result['rejected']}." in live
+
+
+def observers_dynamic():
+    with Session("observers_dynamic", [1, 3, 0, 0, 1, 1, 1, 1, 1]) as session:
         session.ready()
         session.add_client(1)
         until(lambda: "подключён" in session.output("client_1"))
         session.add_observer()
-        duplicate = session.spawn("duplicate", "hotel_observer", ["127.0.0.1", session.port])
-        assert duplicate.wait(timeout=10) == 1
-        session.add_client(2)
-        until(lambda: "назначил" in session.output("server"))
-        late = session.spawn("late", "hotel_observer", ["127.0.0.1", session.port])
-        assert late.wait(timeout=10) == 1
+        second = session.add_observer("observer_second")
+        for number in (2, 3):
+            session.add_client(number)
+        until(lambda: len(re.findall(r"Клиент \d+ заселился", session.output("observer"))) >= 2)
+        session.add_observer("observer_late")
+        snapshot = session.output("observer_late").split("Новые события:")[0]
+        assert "завершил проживание" in snapshot and "проживает в номере 1" in snapshot
+        assert "место в очереди: 1" in snapshot and "время заселения – сутки 1" in snapshot
+        second.terminate()
+        assert second.wait(timeout=10) == 143
+        session.add_observer("observer_reconnected")
         session.wait()
-        session.processes.remove(duplicate)
-        session.processes.remove(late)
-        check_observer(session, check_model(session))
+        result = check_model(session)
+        check_observer(session, result)
+        check_late_observer(session, "observer_late", result)
+        check_late_observer(session, "observer_reconnected", result)
 
 
 def observer_disconnect(sig):
     with Session(f"observer_disconnect_{sig.name}", [1, 2, 0, 0, 1, 1, 1, 1]) as session:
         session.ready()
         observer = session.add_observer()
+        session.add_observer("observer_healthy")
         for number in (1, 2):
             session.add_client(number)
         until(lambda: "назначил" in session.output("server"))
         observer.send_signal(sig)
         session.wait()
         assert observer.returncode == (-sig if sig == signal.SIGKILL else 128 + sig)
-        return check_model(session)
+        result = check_model(session)
+        check_observer(session, result, "observer_healthy")
+        return result
 
 
 def observer_startup_timeout():
@@ -492,20 +530,25 @@ def observer_startup_timeout():
 def observer_invalid_message():
     with Session("observer_invalid_message", [1, 1, 0, 0, 1, 0, 1]) as session:
         session.ready()
+        session.add_observer()
         with session.connect() as observer:
             for byte in wire(15, 0, 0, 0):
                 observer.sendall(bytes([byte]))
-            assert receive(observer) == (16, 1, 1, 1)
+            snapshot = read_snapshot(observer)
+            assert snapshot[0] == (16, 1, 1, 1)
             observer.sendall(wire(1, 0, 1, 0))
             assert receive(observer)[0] == 14
         session.add_client(1)
         session.wait()
-        return check_model(session)
+        result = check_model(session)
+        check_observer(session, result)
+        return result
 
 
 def observer_slow():
     with Session("observer_slow", [10, 10, 0, 0, 1, 0] + [1000] * 10) as session:
         session.ready()
+        session.add_observer()
         with socket.socket() as observer:
             observer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512)
             observer.settimeout(10)
@@ -515,7 +558,138 @@ def observer_slow():
             for number in range(1, 11):
                 session.add_client(number)
             session.wait(timeout=60)
-        return check_model(session)
+        result = check_model(session)
+        check_observer(session, result)
+        return result
+
+
+def observers_complete():
+    with Session("observers_complete", [3, 100, 0, 0, 1, 0] + [i % 3 + 1 for i in range(100)]) as session:
+        session.ready()
+        for name in ("observer", "second", "third"):
+            session.add_observer(name)
+        for number in range(1, 101):
+            session.add_client(number)
+        session.wait(timeout=120)
+        result = check_model(session)
+        for name in session.observers:
+            check_observer(session, result, name)
+
+
+def observers_after_cutoff():
+    with Session("observers_after_cutoff", [1, 3, 1, 1, 3, 1, 4, 1, 1]) as session:
+        session.ready()
+        session.add_observer()
+        for number in (1, 2, 3):
+            session.add_client(number)
+        until(lambda: "Клиент 1 завершил 2 суток" in session.output("observer"))
+        session.add_observer("late")
+        snapshot = session.output("late").split("Новые события:")[0]
+        for line in ["Состояние гостиницы на сутках 3. Приём закрыт.",
+                     "Клиент 1: проживает в номере 1.",
+                     "Клиент 2: ожидает номер, место в очереди: 1.", "Клиент 3: не принят."]:
+            assert line in snapshot, snapshot
+        session.wait()
+        result = check_model(session)
+        check_observer(session, result)
+        check_late_observer(session, "late", result)
+
+
+def observers_reserved():
+    with Session("observers_reserved", [1, 1, 0, 0, 1, 0, 1]) as session:
+        session.ready()
+        with session.connect() as guest:
+            guest.sendall(wire(1, 0, 1, 0))
+            assert receive(guest)[0] == 2
+            assert receive(guest)[0] == 3
+            guest.sendall(wire(5, 0, 1, 0))
+            assert receive(guest)[0] == 6
+            assert receive(guest)[0] == 7
+            session.add_observer()
+            assert "назначен номер 1, ожидается подтверждение" in session.output("observer")
+            guest.sendall(wire(8, 0, 1, 1))
+            assert receive(guest)[0] == 3
+            guest.sendall(wire(9, 1, 1, 1) + wire(10, 1, 1, 0))
+            assert receive(guest)[0] == 11
+        session.wait()
+        assert all(process.returncode == 0 for process in session.processes)
+        assert "Клиент 1 завершил 1 суток проживания из 1." in session.output("observer")
+
+
+def observers_limit():
+    with Session("observers_limit", [1, 1, 0, 0, 1, 0, 1]) as session:
+        session.ready()
+        session.add_observer()
+        connections = []
+        try:
+            for _ in range(99):
+                observer = session.connect()
+                connections.append(observer)
+                observer.sendall(wire(15, 0, 0, 0))
+                read_snapshot(observer)
+            with session.connect() as excess:
+                excess.sendall(wire(15, 0, 0, 0))
+                assert receive(excess)[0] == 14
+            connections.pop().close()
+            session.add_observer("replacement")
+            session.add_client(1)
+            session.wait()
+            result = check_model(session)
+            check_observer(session, result)
+            check_observer(session, result, "replacement")
+        finally:
+            for connection in connections:
+                connection.close()
+
+
+def observers_reconnect():
+    with Session("observers_reconnect", [1, 1, 0, 0, 1, 1, 3]) as session:
+        session.ready()
+        session.add_observer()
+        session.add_client(1)
+        until(lambda: "Клиент 1 заселился" in session.output("observer"))
+        for index in range(12):
+            name = f"connection_{index}"
+            observer = session.add_observer(name)
+            assert "Клиент 1: проживает в номере 1." in session.output(name)
+            observer.terminate()
+            assert observer.wait(timeout=10) == 143
+        session.add_observer("last")
+        session.wait()
+        result = check_model(session)
+        check_observer(session, result)
+        check_late_observer(session, "last", result)
+
+
+def observer_snapshot_wire(invalid=False):
+    folder = RESULTS / ("observer_snapshot_invalid" if invalid else "observer_snapshot_wire")
+    folder.mkdir(exist_ok=True)
+    with socket.socket() as listener, open(folder / "observer.txt", "w") as output:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(10)
+        process = subprocess.Popen([str(BIN / "hotel_observer"), "127.0.0.1", str(listener.getsockname()[1])],
+                                   stdout=output, stderr=subprocess.STDOUT)
+        try:
+            with listener.accept()[0] as connection:
+                connection.settimeout(10)
+                assert receive(connection) == (15, 0, 0, 0)
+                messages = [(16, 2, 1, 1), (19, 3, 1, 1), (20, 0, 1, 4), (21, 8, 1, 1),
+                            (22, 0, 1, 0), (23, 3, 1, 0)]
+                if invalid:
+                    messages = messages[:3] + [(21, 999, 1, 1)]
+                for byte in b"".join(wire(*message) for message in messages):
+                    connection.sendall(bytes([byte]))
+                    time.sleep(0.001)
+                if not invalid:
+                    connection.sendall(wire(3, 4, 0, 0) + wire(9, 4, 1, 4) + wire(10, 4, 1, 1) + wire(18, 4, 1, 0))
+            assert process.wait(timeout=10) == (1 if invalid else 0)
+            if not invalid:
+                assert "Клиент 1 завершил 4 суток проживания из 4." in (folder / "observer.txt").read_text()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
 
 for path in sorted((ROOT / "tests").glob("test_*.txt")):
@@ -547,7 +721,7 @@ for target in ["server", "client"]:
 for path in sorted((ROOT / "tests").glob("test_*.txt")):
     if "invalid" not in path.stem:
         run_case("observer_" + path.stem, lambda path=path: data_case(path, watch=True))
-run_case("observer_rejections", observer_rejections)
+run_case("observers_dynamic", observers_dynamic)
 run_case("observer_startup_timeout", observer_startup_timeout)
 run_case("observer_invalid_message", observer_invalid_message)
 run_case("observer_slow", observer_slow)
@@ -555,5 +729,9 @@ for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]:
     run_case(f"observer_disconnect_{sig.name}", lambda sig=sig: observer_disconnect(sig))
 for target, sig in [("server", signal.SIGINT), ("server", signal.SIGKILL), ("client", signal.SIGTERM)]:
     run_case(f"observer_{target}_{sig.name}", lambda target=target, sig=sig: interrupted(target, sig, watch=True))
+for test in [observers_complete, observers_after_cutoff, observers_reserved, observers_limit, observers_reconnect]:
+    run_case(test.__name__, test)
+run_case("observer_snapshot_wire", observer_snapshot_wire)
+run_case("observer_snapshot_invalid", lambda: observer_snapshot_wire(invalid=True))
 (RESULTS / "summary.json").write_text(json.dumps(passed, ensure_ascii=False, indent=2) + "\n")
 print(f"Пройдено тестов: {len(passed)}.")

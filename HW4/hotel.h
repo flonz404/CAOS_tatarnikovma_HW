@@ -20,6 +20,7 @@
 
 #define MAX_ROOMS 100
 #define MAX_CLIENTS 100
+#define MAX_OBSERVERS 100
 #define MAX_DAYS 10000
 #define MESSAGE_SIZE 16
 #define NETWORK_TIMEOUT 10
@@ -42,7 +43,12 @@ enum MessageType {
     WATCH,
     WATCH_READY,
     RECEPTION_CLOSED,
-    FINISHED
+    FINISHED,
+    SNAPSHOT,
+    CLIENT_INFO,
+    CLIENT_STATE,
+    STAY_START,
+    SNAPSHOT_END
 };
 
 struct Message {

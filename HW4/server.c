@@ -1,6 +1,6 @@
 #include "hotel.h"
 
-#define MAX_CONNECTIONS (MAX_CLIENTS + 8)
+#define MAX_CONNECTIONS (MAX_CLIENTS + MAX_OBSERVERS + 8)
 #define OUTPUT_SIZE (MESSAGE_SIZE * (MAX_CLIENTS * 8 + 8))
 
 enum ClientStatus { NOT_ARRIVED, WAITING, ASSIGNED, LIVING, LEFT, NOT_ACCEPTED };
@@ -26,15 +26,12 @@ int rooms[MAX_ROOMS], queue[MAX_CLIENTS];
 int room_count, client_count, reception_end, delay_seconds;
 int head = 0, tail = 0, joined_count = 0, current_time = 0;
 int started = 0, failed = 0;
-int observer = -1;
 
 void close_connection(int index){
     struct Connection *connection = &connections[index];
     if(connection->fd != -1)
         close(connection->fd);
     connection->fd = -1;
-    if(index == observer)
-        observer = -1;
 }
 
 void connection_lost(int index){
@@ -56,7 +53,7 @@ void queue_message(int index, int type, int day, int value, int extra){
         connection->sent = 0;
     }
     if(connection->output_size + MESSAGE_SIZE > OUTPUT_SIZE){
-        if(index == observer){
+        if(connection->client_index == -2){
             fprintf(stderr, "Наблюдатель отключён: не успевает получать события.\n");
             close_connection(index);
             return;
@@ -71,8 +68,35 @@ void queue_message(int index, int type, int day, int value, int extra){
 }
 
 void observe(int type, int value, int extra){
-    if(observer != -1)
-        queue_message(observer, type, current_time, value, extra);
+    for(int i = 0; i < MAX_CONNECTIONS; ++i){
+        if(connections[i].fd != -1 && connections[i].client_index == -2 && !connections[i].closing)
+            queue_message(i, type, current_time, value, extra);
+    }
+}
+
+void send_snapshot(int index){
+    int states[] = {HELLO, QUEUED, ROOM, CHECKED_IN, CHECKOUT, REJECTED};
+    queue_message(index, WATCH_READY, reception_end, room_count, client_count);
+    queue_message(index, SNAPSHOT, current_time, started, current_time >= reception_end);
+    for(int i = 0; i < client_count; ++i){
+        struct Client *guest = &clients[i];
+        int detail = 0;
+        if(guest->state == NOT_ARRIVED)
+            detail = guest->connection != -1;
+        else if(guest->state == WAITING){
+            for(int j = head; j < tail; ++j){
+                if(queue[j] == i)
+                    detail = j - head + 1;
+            }
+        }
+        else if(guest->state == ASSIGNED || guest->state == LIVING)
+            detail = guest->room_num + 1;
+        queue_message(index, CLIENT_INFO, guest->arrival_time, i + 1, guest->stay_days);
+        queue_message(index, CLIENT_STATE, states[guest->state], i + 1, detail);
+        if(guest->state == ASSIGNED || guest->state == LIVING)
+            queue_message(index, STAY_START, guest->check_in_time, i + 1, 0);
+    }
+    queue_message(index, SNAPSHOT_END, current_time, started, 0);
 }
 
 int find_free_room(int rooms[], int room_count){
@@ -118,24 +142,22 @@ void protocol_error(int index){
 
 void handle_message(int index, struct Message message){
     struct Connection *connection = &connections[index];
-    if(index == observer){
+    if(connection->client_index == -2){
         protocol_error(index);
         return;
     }
     if(connection->client_index == -1){
         if(message.type == WATCH && message.day == 0 && message.value == 0 && message.extra == 0){
-            if(started || observer != -1){
+            int observer_count = 0;
+            for(int i = 0; i < MAX_CONNECTIONS; ++i)
+                observer_count += connections[i].fd != -1 && connections[i].client_index == -2;
+            if(observer_count >= MAX_OBSERVERS){
                 queue_message(index, ERROR_MESSAGE, current_time, 3, 0);
                 connection->closing = 1;
                 return;
             }
-            observer = index;
             connection->client_index = -2;
-            queue_message(index, WATCH_READY, reception_end, room_count, client_count);
-            for(int i = 0; i < client_count; ++i){
-                if(clients[i].connection != -1)
-                    observe(HELLO, i + 1, 0);
-            }
+            send_snapshot(index);
             printf("Наблюдатель подключён.\n");
             return;
         }
@@ -310,7 +332,8 @@ void service_network(int listener, int timeout){
 
 int output_pending(int include_observer){
     for(int i = 0; i < MAX_CONNECTIONS; ++i){
-        if((include_observer || i != observer) && connections[i].fd != -1 && connections[i].output_size != 0)
+        if((include_observer || connections[i].client_index != -2) &&
+           connections[i].fd != -1 && connections[i].output_size != 0)
             return 1;
     }
     return 0;
@@ -466,8 +489,10 @@ int main(int argc, char *argv[]){
         for(int i = 0; i < client_count; ++i)
             completed += clients[i].state == LEFT;
         observe(FINISHED, completed, client_count - completed);
-        if(observer != -1)
-            connections[observer].closing = 1;
+        for(int i = 0; i < MAX_CONNECTIONS; ++i){
+            if(connections[i].client_index == -2)
+                connections[i].closing = 1;
+        }
     }
     double deadline = current_seconds() + 2;
     while(output_pending(1) && current_seconds() < deadline)
